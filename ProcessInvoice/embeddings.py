@@ -13,7 +13,7 @@ def _maybe_embedding_client() -> Optional[AzureOpenAI]:
     if not endpoint or not key:
         return None
     return AzureOpenAI(
-        credential=AzureKeyCredential(key),
+        api_key=key,
         azure_endpoint=endpoint,
         api_version=api_version,
     )

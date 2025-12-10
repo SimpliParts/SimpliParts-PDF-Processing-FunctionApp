@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Dict, Any, List, Optional
 
 import azure.functions as func
@@ -15,6 +16,18 @@ from .gemini import (
     gemini_extract_from_pdf,
     gemini_reconcile,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _quiet_azure_http_logging() -> None:
+    """
+    Reduce noisy request/response headers from Azure SDK HTTP logging.
+    """
+    logging.getLogger("azure").setLevel(logging.WARNING)
+    logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+    logging.getLogger("azure.storage").setLevel(logging.WARNING)
+    logging.getLogger("azure.ai").setLevel(logging.WARNING)
 
 
 def _clean_part_number(part_number: Optional[str]) -> Optional[str]:
@@ -42,7 +55,8 @@ def _build_db_ready(source_blob_url: str, final_data: Dict[str, Any], shop_id: O
     totals = final_data.get("totals") or {}
     line_items = final_data.get("line_items") or []
 
-    ro_number = header.get("invoice_number") or header.get("po_number")
+    # Prefer PO number as RO number; fall back to invoice number.
+    ro_number = header.get("po_number") or header.get("invoice_number")
     repair_order = {
         "shop_id": shop_id,
         "ro_number": ro_number,
@@ -90,7 +104,9 @@ def _build_db_ready(source_blob_url: str, final_data: Dict[str, Any], shop_id: O
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info("ProcessInvoice triggered")
+    _quiet_azure_http_logging()
+    start_time = time.time()
+    logger.info("ProcessInvoice triggered")
 
     # Optional static header auth (set EXPECT_HEADER_NAME and EXPECT_HEADER_VALUE env vars)
     expect_header_name = os.environ.get("EXPECT_HEADER_NAME")
@@ -109,13 +125,55 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
     if not blob_url:
         return func.HttpResponse("blob_url is required", status_code=400)
 
+    shop_id = body.get("shop_id")
+
+    max_pdf_bytes = int(os.environ.get("MAX_PDF_BYTES", str(15 * 1024 * 1024)))  # default 15MB
+
     try:
+        logger.info("Download start", extra={"blob_url": blob_url, "shop_id": shop_id})
         pdf_bytes = download_pdf(blob_url)
-        di_payload = analyze_with_di(pdf_bytes)
+        size_bytes = len(pdf_bytes)
+        if size_bytes > max_pdf_bytes:
+            logger.warning("PDF too large", extra={"size_bytes": size_bytes, "limit": max_pdf_bytes})
+            return func.HttpResponse(f"PDF exceeds size limit ({size_bytes} > {max_pdf_bytes})", status_code=400)
+        logger.info("Download complete", extra={"size_bytes": size_bytes})
+
+        di_payload = None
+        di_failed = False
+        di_error = None
+        try:
+            logger.info("DI start", extra={"model": "prebuilt-read"})
+            di_payload = analyze_with_di(pdf_bytes)
+            logger.info("DI complete", extra={"pages": len(di_payload.get('pages') or []), "documents": len(di_payload.get('documents') or [])})
+        except Exception as di_exc:
+            di_failed = True
+            di_error = str(di_exc)
+            logger.exception("DI failed; continuing with PDF-only extraction")
+
         ensure_gemini()
-        pass_a = gemini_extract_from_di(di_payload)
+
+        pass_a = None
+        if not di_failed:
+            logger.info("Gemini pass A (DI) start")
+            pass_a = gemini_extract_from_di(di_payload)
+            logger.info("Gemini pass A complete")
+
+        logger.info("Gemini pass B (PDF) start")
         pass_b = gemini_extract_from_pdf(pdf_bytes)
-        final_payload = gemini_reconcile(pass_a, pass_b, di_payload)
+        logger.info("Gemini pass B complete")
+
+        if not di_failed and pass_a:
+            logger.info("Gemini reconcile start")
+            final_payload = gemini_reconcile(pass_a, pass_b, di_payload)
+            logger.info("Gemini reconcile complete")
+        else:
+            # Fallback: use PDF-only extraction as final
+            final_payload = {
+                "data": pass_b.get("data") if isinstance(pass_b, dict) and pass_b.get("data") else pass_b,
+                "warnings": ["DI failed; using PDF-only extraction"],
+                "confidence": (pass_b.get("confidence") if isinstance(pass_b, dict) else "low") or "low",
+                "fields_needing_review": [],
+            }
 
         # Optional: generate embeddings for each final line item if Azure OpenAI embedding config is present
         line_items = (final_payload.get("data") or {}).get("line_items") or []
@@ -126,18 +184,18 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 line["embedding"] = emb
                 embeddings_generated += 1
 
-        db_ready = _build_db_ready(blob_url, final_payload.get("data") or {}, body.get("shop_id"))
+        db_ready = _build_db_ready(blob_url, final_payload.get("data") or {}, shop_id)
 
         response = {
             "final": final_payload,
             "pass_a": pass_a,
             "pass_b": pass_b,
-            "di_summary": summarize_di(di_payload),
+            "di_summary": summarize_di(di_payload) if di_payload else {"error": di_error},
             "source": {
                 "blob_url": blob_url,
                 "invoice_hint": body.get("invoice_id") or body.get("po_number"),
                 "vendor_hint": body.get("vendor_hint"),
-                "shop_id": body.get("shop_id"),
+                "shop_id": shop_id,
             },
             "embedding": {
                 "enabled": embeddings_generated > 0,
@@ -147,11 +205,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             },
             "db_ready": db_ready,
         }
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        logger.info("ProcessInvoice succeeded", extra={"shop_id": shop_id, "elapsed_ms": elapsed_ms, "line_items": len(line_items), "embeddings_generated": embeddings_generated})
         return func.HttpResponse(json.dumps(response), status_code=200, mimetype="application/json")
     except requests.HTTPError as http_err:
-        logging.exception("Download failed")
+        logger.exception("Download failed")
         return func.HttpResponse(f"Failed to download PDF: {http_err}", status_code=400)
     except Exception as ex:
-        logging.exception("Processing error")
+        logger.exception("Processing error")
         return func.HttpResponse(f"Processing failed: {ex}", status_code=500)
 
